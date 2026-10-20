@@ -1,0 +1,56 @@
+# MSUPTECH_MSDESK_TRAVA_V1 — monta o servidor do MS Desk (hbbs/hbbr 1.1.16 com a trava de licenca da MSuptech)
+# para Linux x86_64 (binario estatico musl, igual ao oficial). Rodar: Actions -> "MS Desk Server" -> Run workflow.
+name: MS Desk Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload-tag:
+        type: string
+        default: "msdesk-server-1.1.16-m1"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: "1.90"
+          override: true
+          default: true
+          profile: minimal
+          target: x86_64-unknown-linux-musl
+
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --all-features --target=x86_64-unknown-linux-musl
+          use-cross: true
+
+      - name: Juntar
+        run: |
+          mkdir -p final
+          cp target/x86_64-unknown-linux-musl/release/hbbs final/hbbs
+          cp target/x86_64-unknown-linux-musl/release/hbbr final/hbbr
+          chmod a+x final/*
+          sha256sum final/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msdesk-server-linux-amd64
+          path: final/*
+
+      - name: Publicar
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          tag_name: ${{ inputs.upload-tag }}
+          files: final/*

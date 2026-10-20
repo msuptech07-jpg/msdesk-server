@@ -69,6 +69,46 @@ struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: Strin
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
+// MSUPTECH_MSDESK_TRAVA_V1 (20/10/2026): "nao pagou, nao usa". Quem PEDE a conexao (o tecnico) precisa mandar, no
+// campo token, a licenca assinada pelo servidor de licencas da MSuptech (msdesk1.<id>.<ate>.<plano>.<assinatura>,
+// Ed25519). Sem licenca valida a conexao e recusada com o aviso abaixo. Quem recebe suporte nao precisa de nada.
+// A chave publica vem da variavel MSDESK_LICENCA_PUB (base64); sem ela a trava fica desligada.
+static MSDESK_PUB: Lazy<Option<sign::PublicKey>> = Lazy::new(|| {
+    let b = std::env::var("MSDESK_LICENCA_PUB").ok()?;
+    let v = base64::decode(b.trim()).ok()?;
+    sign::PublicKey::from_slice(&v)
+});
+const MSDESK_AVISO: &str =
+    "O teste grátis do MS Desk acabou ou a assinatura venceu. Assine em acesso.msuptech.com.br/assinar";
+
+fn msdesk_licenca_ok(token: &str) -> bool {
+    let pk = match MSDESK_PUB.as_ref() {
+        Some(p) => p,
+        None => return true,
+    };
+    let partes: Vec<&str> = token.split('.').collect();
+    if partes.len() != 5 || partes[0] != "msdesk1" {
+        return false;
+    }
+    let ate: u64 = match partes[2].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let agora = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if ate < agora {
+        return false;
+    }
+    let mut assinado = match base64::decode_config(partes[4], base64::URL_SAFE_NO_PAD) {
+        Ok(s) if s.len() == 64 => s,
+        _ => return false,
+    };
+    assinado.extend_from_slice(format!("msdesk1|{}|{}|{}", partes[1], partes[2], partes[3]).as_bytes());
+    sign::verify(&assinado, pk).is_ok()
+}
+
 #[derive(Clone)]
 struct Inner {
     serial: i32,
@@ -495,6 +535,17 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    // MSUPTECH_MSDESK_TRAVA_V1: pedido de repasse direto tambem precisa de licenca
+                    if !msdesk_licenca_ok(&rf.token) {
+                        log::info!("MSDESK licenca recusada (repasse) de {} para {}", addr, rf.id);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            refuse_reason: MSDESK_AVISO.to_owned(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return true;
+                    }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
@@ -684,6 +735,16 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        // MSUPTECH_MSDESK_TRAVA_V1: sem licenca valida, recusa com o aviso de assinatura
+        if !msdesk_licenca_ok(&ph.token) {
+            log::info!("MSDESK licenca recusada de {} para {}", addr, ph.id);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: MSDESK_AVISO.to_owned(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
